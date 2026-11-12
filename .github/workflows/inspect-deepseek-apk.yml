@@ -52,7 +52,13 @@ jobs:
             echo "Java source files found"
             echo
             echo "== Decoded manifest =="
-            find /tmp/jadx-out/resources -iname 'AndroidManifest.xml' -type f -print -exec sed -n '1,260p' {} ; 2>/dev/null
+            MANIFEST="$(find /tmp/jadx-out/resources -iname 'AndroidManifest.xml' -type f -print -quit 2>/dev/null)"
+            if [ -n "$MANIFEST" ]; then
+              echo "Manifest file: $MANIFEST"
+              sed -n '1,260p' "$MANIFEST"
+            else
+              echo "JADX did not emit a decoded manifest"
+            fi
             echo
             echo "== DeepSeek app package classes =="
             find /tmp/jadx-out/sources/com/deepseek/chat -type f -name '*.java' 2>/dev/null \
