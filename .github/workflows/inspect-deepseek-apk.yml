@@ -34,7 +34,7 @@ jobs:
       - name: Decompile for structural analysis
         run: |
           mkdir -p /tmp/dplab-apk-inspection
-          /tmp/jadx/bin/jadx --show-bad-code --no-res \
+          /tmp/jadx/bin/jadx --show-bad-code \
             -d /tmp/jadx-out deepseek-2-7-5.apk \
             > /tmp/jadx.log 2>&1 || true
 
@@ -50,6 +50,23 @@ jobs:
             echo "== Decompiled project summary =="
             find /tmp/jadx-out/sources -type f -name '*.java' 2>/dev/null | wc -l
             echo "Java source files found"
+            echo
+            echo "== Decoded manifest =="
+            find /tmp/jadx-out/resources -iname 'AndroidManifest.xml' -type f -print -exec sed -n '1,260p' {} ; 2>/dev/null
+            echo
+            echo "== DeepSeek app package classes =="
+            find /tmp/jadx-out/sources/com/deepseek/chat -type f -name '*.java' 2>/dev/null \
+              | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 500
+            echo
+            echo "== DeepSeek app method signatures (not method bodies) =="
+            grep -RhnE '^[[:space:]]*(public|protected|private)[[:space:]].*\(' \
+              /tmp/jadx-out/sources/com/deepseek/chat 2>/dev/null \
+              | sed -E 's/^[[:space:]]+//' | head -n 350
+            echo
+            echo "== Decompiled application classes referencing app shell and navigation =="
+            grep -RIlE 'MainActivity|ComponentActivity|NavHost|NavController|setContent\(|ComposeView|startDestination|chat\.deepseek\.com' \
+              /tmp/jadx-out/sources/com/deepseek/chat /tmp/jadx-out/sources/defpackage 2>/dev/null \
+              | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 350
             find /tmp/jadx-out/sources -type f -name '*.java' 2>/dev/null \
               | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 500
             echo
