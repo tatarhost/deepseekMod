@@ -1,0 +1,23 @@
+plugins {
+    id 'com.android.application'
+}
+def buildNumber = (project.findProperty('buildNumber') ?: '1').toString().toInteger()
+android {
+    namespace 'com.tatarhost.dplab'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.tatarhost.dplab'
+        minSdk 26
+        targetSdk 35
+        versionCode buildNumber
+        versionName '1.0.' + buildNumber
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes {
+        debug { applicationIdSuffix ''; versionNameSuffix '' }
+        release { minifyEnabled false }
+    }
+}
