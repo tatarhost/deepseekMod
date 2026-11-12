@@ -1,0 +1,64 @@
+name: Inspect DeepSeek APK manifest and signature
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-apk-manifest.yml"
+      - "deepseek-2-7-5.apk"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Android build tools
+        run: |
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" "build-tools;35.0.0"
+
+      - name: Read package, manifest components and certificate
+        run: |
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          mkdir -p /tmp/apk-report
+          {
+            echo "== APK =="
+            file deepseek-2-7-5.apk
+            sha256sum deepseek-2-7-5.apk
+            echo
+            echo "== Package / SDK / version =="
+            "$AAPT" dump badging deepseek-2-7-5.apk | head -n 50
+            echo
+            echo "== Manifest activities, aliases and services =="
+            "$AAPT" dump xmltree deepseek-2-7-5.apk AndroidManifest.xml \
+              | grep -E -A 5 -B 2 'E: (activity|activity-alias|service|receiver|application)|A android:name|A android:exported|A android:targetActivity|A android:launchMode|A android:process' \
+              | head -n 400
+            echo
+            echo "== Requested permissions =="
+            "$AAPT" dump permissions deepseek-2-7-5.apk
+            echo
+            echo "== Original APK signing certificate =="
+            "$APKSIGNER" verify --print-certs deepseek-2-7-5.apk
+          } > /tmp/apk-report/report.txt
+          cd /tmp/apk-report
+          zip -q manifest-report.zip report.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-apk-manifest-signature
+          path: /tmp/apk-report/manifest-report.zip
+          if-no-files-found: error
+          retention-days: 7
