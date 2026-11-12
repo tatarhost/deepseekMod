@@ -1,0 +1,84 @@
+name: Inspect original DeepSeek APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-deepseek-apk.yml"
+      - "deepseek-2-7-5.apk"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout original APK
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download JADX
+        run: |
+          curl -L --fail --retry 3 \
+            -o /tmp/jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.2/jadx-1.5.2.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+
+      - name: Decompile for structural analysis
+        run: |
+          mkdir -p /tmp/dplab-apk-inspection
+          /tmp/jadx/bin/jadx --show-bad-code --no-res \
+            -d /tmp/jadx-out deepseek-2-7-5.apk \
+            > /tmp/jadx.log 2>&1 || true
+
+          {
+            echo "dpLab original APK inspection"
+            echo "APK: deepseek-2-7-5.apk"
+            echo
+            echo "== Binary metadata =="
+            file deepseek-2-7-5.apk
+            sha256sum deepseek-2-7-5.apk
+            unzip -l deepseek-2-7-5.apk | tail -n 8
+            echo
+            echo "== Decompiled project summary =="
+            find /tmp/jadx-out/sources -type f -name '*.java' 2>/dev/null | wc -l
+            echo "Java source files found"
+            find /tmp/jadx-out/sources -type f -name '*.java' 2>/dev/null \
+              | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 500
+            echo
+            echo "== App entry / activities / services =="
+            grep -RIlE 'extends (Application|Activity|Fragment|Service)|@Override[[:space:]]*$' \
+              /tmp/jadx-out/sources 2>/dev/null \
+              | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 250
+            echo
+            echo "== Candidate integration points (file names only) =="
+            grep -RIlE 'WebView|NavigationBar|BottomNavigation|DrawerLayout|Toolbar|onCreateOptionsMenu|onOptionsItemSelected|ACTION_MAIN|chat\.deepseek\.com|deepseek\.com' \
+              /tmp/jadx-out/sources 2>/dev/null \
+              | sed 's#/tmp/jadx-out/sources/##' | sort | head -n 300
+            echo
+            echo "== Relevant resource names =="
+            find /tmp/jadx-out/resources -type f 2>/dev/null \
+              | sed 's#/tmp/jadx-out/resources/##' | grep -E '(^res/layout|^res/menu|^res/drawable|AndroidManifest)' \
+              | sort | head -n 300
+            echo
+            echo "== JADX diagnostics =="
+            tail -n 60 /tmp/jadx.log
+          } > /tmp/dplab-apk-inspection/report.txt
+
+          cd /tmp/dplab-apk-inspection
+          zip -q inspection-report.zip report.txt
+
+      - name: Upload structural report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-apk-structural-inspection
+          path: /tmp/dplab-apk-inspection/inspection-report.zip
+          if-no-files-found: error
+          retention-days: 7
