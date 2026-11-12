@@ -1,0 +1,183 @@
+name: Build original DeepSeek dpLab mod
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mod-src/**"
+      - ".github/workflows/build-original-dplab-mod.yml"
+      - "deepseek-2-7-5.apk"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK platform and build tools
+        run: |
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Download Apktool
+        run: |
+          curl -L --fail --retry 3 \
+            -o /tmp/apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          printf '#!/bin/sh\nexec java -jar /tmp/apktool.jar "$@"\n' > /tmp/apktool
+          chmod +x /tmp/apktool
+
+      - name: Decode original DeepSeek APK
+        run: |
+          /tmp/apktool d -f deepseek-2-7-5.apk -o /tmp/deepseek-decoded
+          test -f /tmp/deepseek-decoded/smali/com/deepseek/chat/MainActivity.smali
+          test -d /tmp/deepseek-decoded/smali_classes3
+
+      - name: Inject dpLab overlay into the original launcher
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          root = Path("/tmp/deepseek-decoded")
+          smali = root / "smali/com/deepseek/chat/MainActivity.smali"
+          source = smali.read_text(encoding="utf-8")
+          start = source.find(".method public final onCreate(Landroid/os/Bundle;)V")
+          if start < 0:
+              raise SystemExit("MainActivity.onCreate signature not found")
+          end = source.find(".end method", start)
+          if end < 0:
+              raise SystemExit("MainActivity.onCreate end not found")
+          method = source[start:end]
+          call = "    invoke-static {p0}, Lcom/deepseek/chat/mod/ModOverlay;->attach(Ljava/lang/Object;)V\n\n"
+          if "Lcom/deepseek/chat/mod/ModOverlay;->attach" not in method:
+              needle = "    return-void"
+              if needle not in method:
+                  raise SystemExit("MainActivity.onCreate return instruction not found")
+              method = method.replace(needle, call + needle, 1)
+              source = source[:start] + method + source[end:]
+              smali.write_text(source, encoding="utf-8")
+
+          manifest = root / "AndroidManifest.xml"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ns = "{http://schemas.android.com/apk/res/android}"
+          tree = ET.parse(str(manifest))
+          manifest_root = tree.getroot()
+          app = manifest_root.find("application")
+          if app is None:
+              raise SystemExit("AndroidManifest application node not found")
+
+          app.set(ns + "label", "DeepSeek dpLab")
+          app.set(ns + "allowBackup", "false")
+          activity_name = "com.deepseek.chat.mod.ModToolsActivity"
+          existing = [node for node in app.findall("activity")
+                      if node.get(ns + "name") == activity_name]
+          if not existing:
+              activity = ET.SubElement(app, "activity")
+              activity.set(ns + "name", activity_name)
+              activity.set(ns + "exported", "false")
+              activity.set(ns + "theme", "@style/Theme.DeepSeek")
+              activity.set(ns + "configChanges", "orientation|screenSize|keyboardHidden")
+          build = int(os.environ.get("BUILD_NUMBER", "1"))
+          manifest_root.set(ns + "versionCode", str(295 + build))
+          manifest_root.set(ns + "versionName", "2.7.5-dpLab." + str(build))
+          tree.write(str(manifest), encoding="utf-8", xml_declaration=True)
+
+          print("Injected dpLab overlay hook into original MainActivity.onCreate")
+          print("Added internal ModToolsActivity; original launcher and chat routes preserved")
+          PY
+
+      - name: Compile dpLab tools into an additional DEX
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
+          mkdir -p /tmp/mod-classes /tmp/mod-dex
+          find mod-src -type f -name '*.java' > /tmp/mod-sources.txt
+          test -s /tmp/mod-sources.txt
+          javac -source 8 -target 8 -classpath "$ANDROID_JAR" \
+            -d /tmp/mod-classes @/tmp/mod-sources.txt
+          find /tmp/mod-classes -type f -name '*.class' > /tmp/mod-classes.txt
+          "$BUILD_TOOLS/d8" --min-api 24 --lib "$ANDROID_JAR" \
+            --output /tmp/mod-dex @/tmp/mod-classes.txt
+          test -f /tmp/mod-dex/classes.dex
+          cp /tmp/mod-dex/classes.dex /tmp/classes4.dex
+          ls -lh /tmp/classes4.dex
+
+      - name: Rebuild the original APK with dpLab hook
+        run: |
+          /tmp/apktool b /tmp/deepseek-decoded --use-aapt2 -o /tmp/deepseek-base-unsigned.apk
+          cd /tmp
+          zip -q deepseek-base-unsigned.apk classes4.dex
+          cd "$GITHUB_WORKSPACE"
+          unzip -l /tmp/deepseek-base-unsigned.apk | grep 'classes4.dex'
+          mkdir -p dist
+          cp /tmp/deepseek-base-unsigned.apk dist/deepseek-dplab-unsigned.apk
+
+      - name: Align and sign the modified APK
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          PASS="$(openssl rand -hex 24)"
+          keytool -genkeypair -v \
+            -keystore /tmp/dplab-mod.keystore \
+            -storepass "$PASS" -keypass "$PASS" \
+            -alias dplab-mod -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=dpLab, OU=Personal Mod, O=dpLab, C=NL"
+          "$BUILD_TOOLS/zipalign" -f -p 4 \
+            dist/deepseek-dplab-unsigned.apk /tmp/deepseek-dplab-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks /tmp/dplab-mod.keystore \
+            --ks-key-alias dplab-mod \
+            --ks-pass "pass:$PASS" \
+            --key-pass "pass:$PASS" \
+            --out dist/dpLab-DeepSeek-2.7.5-mod.apk \
+            /tmp/deepseek-dplab-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose dist/dpLab-DeepSeek-2.7.5-mod.apk
+
+      - name: Verify package and injected components
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          "$BUILD_TOOLS/aapt" dump badging dist/dpLab-DeepSeek-2.7.5-mod.apk | head -n 25
+          "$BUILD_TOOLS/aapt" dump xmltree dist/dpLab-DeepSeek-2.7.5-mod.apk AndroidManifest.xml \
+            | grep -E -A 5 -B 2 'com.deepseek.chat.mod.ModToolsActivity|com.deepseek.chat.MainActivity'
+          unzip -l dist/dpLab-DeepSeek-2.7.5-mod.apk | grep -E 'classes[0-9]*\.dex'
+          sha256sum dist/dpLab-DeepSeek-2.7.5-mod.apk
+
+      - name: Upload mod APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dpLab-DeepSeek-mod-${{ github.run_number }}
+          path: dist/dpLab-DeepSeek-2.7.5-mod.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dplab-deepseek-v2.7.5-${{ github.run_number }}
+          name: dpLab DeepSeek mod 2.7.5 · build ${{ github.run_number }}
+          generate_release_notes: true
+          files: dist/dpLab-DeepSeek-2.7.5-mod.apk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
