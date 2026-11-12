@@ -1,0 +1,71 @@
+name: Inspect DeepSeek smali integration point
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-deepseek-smali.yml"
+      - "deepseek-2-7-5.apk"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Apktool
+        run: |
+          curl -L --fail --retry 3 \
+            -o /tmp/apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          printf '#!/bin/sh\nexec java -jar /tmp/apktool.jar "$@"\n' > /tmp/apktool
+          chmod +x /tmp/apktool
+      - name: Decode smali and inspect launcher
+        run: |
+          /tmp/apktool d -f deepseek-2-7-5.apk -o /tmp/deepseek-decoded \
+            > /tmp/apktool-decode.log 2>&1
+          mkdir -p /tmp/smali-report
+          {
+            echo "== Decoded package =="
+            grep -E '^(package|versionCode|versionName):' /tmp/deepseek-decoded/apktool.yml || true
+            echo
+            echo "== MainActivity smali file =="
+            find /tmp/deepseek-decoded -path '*/com/deepseek/chat/MainActivity.smali' -print
+            MAIN="$(find /tmp/deepseek-decoded -path '*/com/deepseek/chat/MainActivity.smali' -print -quit)"
+            if [ -n "$MAIN" ]; then
+              echo
+              echo "== MainActivity class / fields / lifecycle method declarations =="
+              grep -nE '^\.class|^\.super|^\.field|^\.method|^\.end method' "$MAIN" | head -n 180
+              echo
+              echo "== onCreate method (for patch feasibility) =="
+              awk '
+                /^\.method .*onCreate\(Landroid\/os\/Bundle;\)V/ { show=1 }
+                show { print }
+                show && /^\.end method/ { exit }
+              ' "$MAIN" | head -n 420
+            fi
+            echo
+            echo "== Smali dex folders =="
+            find /tmp/deepseek-decoded -maxdepth 1 -type d -name 'smali*' -printf '%f\n' | sort
+            echo
+            echo "== Manifest launcher declaration =="
+            grep -n -A 18 -B 5 'com.deepseek.chat.MainActivity' /tmp/deepseek-decoded/AndroidManifest.xml | head -n 80
+            echo
+            echo "== Apktool diagnostics =="
+            tail -n 50 /tmp/apktool-decode.log
+          } > /tmp/smali-report/report.txt
+          cd /tmp/smali-report
+          zip -q smali-inspection.zip report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-smali-integration-point
+          path: /tmp/smali-report/smali-inspection.zip
+          if-no-files-found: error
+          retention-days: 7
