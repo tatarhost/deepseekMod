@@ -11,6 +11,8 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.net.http.SslError;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
 import android.text.InputType;
@@ -23,6 +25,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.webkit.CookieManager;
+import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
@@ -37,6 +47,8 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
     private static final int PICK_FOLDER = 20;
     private static final int PICK_FILE = 21;
+    private static final int PICK_WEB_FILES = 22;
+    private static final String OFFICIAL_CHAT_URL = "https://chat.deepseek.com/";
     private static final int BG = Color.rgb(9, 12, 16);
     private static final int PANEL = Color.rgb(20, 25, 32);
     private static final int PANEL2 = Color.rgb(28, 34, 43);
@@ -47,13 +59,17 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final List<Skill> skills = new ArrayList<>();
     private SharedPreferences prefs;
-    private String page = "ai";
+    private String page = "official";
     private String draft = "";
     private String activeSkill = "general";
     private EditText prompt;
     private EditText tokenField;
     private TextView githubState;
     private TextView repoList;
+    private WebView officialChat;
+    private TextView officialChatStatus;
+    private ValueCallback<Uri[]> pendingWebUpload;
+    private boolean officialChatStarted;
 
     private static final class Skill {
         final String id, name, instruction;
@@ -71,8 +87,40 @@ public class MainActivity extends Activity {
         render();
     }
 
+    @Override protected void onPause() {
+        if (officialChat != null) {
+            officialChat.onPause();
+            CookieManager.getInstance().flush();
+        }
+        super.onPause();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (officialChat != null) officialChat.onResume();
+    }
+
+    @Override public void onBackPressed() {
+        if ("official".equals(page) && officialChat != null && officialChat.canGoBack()) {
+            officialChat.goBack();
+            return;
+        }
+        super.onBackPressed();
+    }
+
     @Override protected void onDestroy() {
         executor.shutdownNow();
+        if (pendingWebUpload != null) {
+            pendingWebUpload.onReceiveValue(null);
+            pendingWebUpload = null;
+        }
+        if (officialChat != null) {
+            officialChat.stopLoading();
+            officialChat.setWebChromeClient(null);
+            officialChat.setWebViewClient(null);
+            officialChat.destroy();
+            officialChat = null;
+        }
         super.onDestroy();
     }
 
@@ -161,7 +209,7 @@ public class MainActivity extends Activity {
         HorizontalScrollView bar = new HorizontalScrollView(this);
         bar.setHorizontalScrollBarEnabled(false);
         LinearLayout tabs = new LinearLayout(this);
-        String[][] all = {{"ai","AI"},{"files","Файлы"},{"connectors","Коннекторы"},{"skills","Скилы"}};
+        String[][] all = {{"official","Чат"},{"ai","dpLab AI"},{"files","Файлы"},{"connectors","Коннекторы"},{"skills","Скилы"}};
         for (String[] item : all) {
             TextView tab = text(item[1], 13, page.equals(item[0]) ? BG : MUTED, true);
             tab.setGravity(Gravity.CENTER);
@@ -181,6 +229,16 @@ public class MainActivity extends Activity {
         bp.topMargin = dp(17); bp.bottomMargin = dp(13);
         root.addView(bar, bp);
 
+        if (page.equals("official")) {
+            officialChatPage(root);
+            setContentView(root);
+            if (!officialChatStarted && officialChat != null) {
+                officialChatStarted = true;
+                officialChat.loadUrl(OFFICIAL_CHAT_URL);
+            }
+            return;
+        }
+
         ScrollView scroll = new ScrollView(this);
         LinearLayout body = column();
         body.setPadding(0, 0, 0, dp(22));
@@ -192,6 +250,149 @@ public class MainActivity extends Activity {
         else if (page.equals("connectors")) connectorsPage(body);
         else if (page.equals("skills")) skillsPage(body);
         else aiPage(body);
+    }
+
+    private void officialChatPage(LinearLayout root) {
+        LinearLayout toolbar = new LinearLayout(this);
+        toolbar.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("Официальный веб-чат DeepSeek", 13, MUTED, true);
+        toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView reload = button("↻", () -> {
+            if (officialChat != null) officialChat.reload();
+        });
+        TextView browser = button("↗", () -> open(OFFICIAL_CHAT_URL));
+        LinearLayout.LayoutParams toolLp = new LinearLayout.LayoutParams(dp(48), dp(42));
+        toolLp.leftMargin = dp(6);
+        toolbar.addView(reload, toolLp);
+        LinearLayout.LayoutParams browserLp = new LinearLayout.LayoutParams(dp(48), dp(42));
+        browserLp.leftMargin = dp(6);
+        toolbar.addView(browser, browserLp);
+        LinearLayout.LayoutParams toolbarLp = new LinearLayout.LayoutParams(-1, -2);
+        toolbarLp.bottomMargin = dp(8);
+        root.addView(toolbar, toolbarLp);
+
+        if (officialChatStatus == null) {
+            officialChatStatus = text("Подключение к chat.deepseek.com…", 11, MUTED, false);
+        }
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
+        statusLp.bottomMargin = dp(5);
+        root.addView(officialChatStatus, statusLp);
+
+        if (officialChat == null) createOfficialChat();
+        if (officialChat.getParent() instanceof ViewGroup) {
+            ((ViewGroup) officialChat.getParent()).removeView(officialChat);
+        }
+        root.addView(officialChat, new LinearLayout.LayoutParams(-1, 0, 1));
+    }
+
+    private void createOfficialChat() {
+        officialChat = new WebView(this);
+        officialChat.setBackgroundColor(Color.WHITE);
+        WebSettings settings = officialChat.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
+        settings.setSupportMultipleWindows(false);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        if (Build.VERSION.SDK_INT >= 26) officialChat.setSafeBrowsingEnabled(true);
+
+        CookieManager cookies = CookieManager.getInstance();
+        cookies.setAcceptCookie(true);
+        cookies.setAcceptThirdPartyCookies(officialChat, true);
+
+        officialChat.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return routeOfficialUrl(request.getUrl());
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return routeOfficialUrl(Uri.parse(url));
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                if (officialChatStatus != null) {
+                    officialChatStatus.setText("Открываю официальный сервис…");
+                }
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                CookieManager.getInstance().flush();
+                if (officialChatStatus != null) {
+                    officialChatStatus.setText("Официальный сервис · " + Uri.parse(url).getHost());
+                }
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+                handler.cancel();
+                if (officialChatStatus != null) {
+                    officialChatStatus.setText("Ошибка защищённого соединения. Переход отменён.");
+                }
+            }
+        });
+
+        officialChat.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView webView,
+                    ValueCallback<Uri[]> filePathCallback, FileChooserParams params) {
+                if (pendingWebUpload != null) pendingWebUpload.onReceiveValue(null);
+                pendingWebUpload = filePathCallback;
+                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                picker.addCategory(Intent.CATEGORY_OPENABLE);
+                picker.setType("*/*");
+                picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                String[] accepted = params.getAcceptTypes();
+                if (accepted != null && accepted.length > 0) {
+                    java.util.ArrayList<String> types = new java.util.ArrayList<>();
+                    for (String type : accepted) {
+                        if (type != null && type.contains("/")) types.add(type);
+                    }
+                    if (!types.isEmpty()) {
+                        picker.putExtra(Intent.EXTRA_MIME_TYPES, types.toArray(new String[0]));
+                    }
+                }
+                picker.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
+                        params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
+                try {
+                    startActivityForResult(picker, PICK_WEB_FILES);
+                    return true;
+                } catch (Exception e) {
+                    pendingWebUpload.onReceiveValue(null);
+                    pendingWebUpload = null;
+                    toast("Не удалось открыть выбор файла");
+                    return false;
+                }
+            }
+        });
+    }
+
+    private boolean routeOfficialUrl(Uri uri) {
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        if ("https".equalsIgnoreCase(scheme) && host != null) {
+            String lower = host.toLowerCase(java.util.Locale.ROOT);
+            if (lower.equals("deepseek.com") || lower.endsWith(".deepseek.com")
+                    || lower.equals("accounts.google.com")
+                    || lower.equals("appleid.apple.com")) {
+                return false;
+            }
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+        } catch (Exception e) {
+            toast("Не удалось открыть внешнюю ссылку");
+        }
+        return true;
     }
 
     private void aiPage(LinearLayout body) {
@@ -424,6 +625,25 @@ public class MainActivity extends Activity {
     @Override @SuppressWarnings("deprecation")
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == PICK_WEB_FILES) {
+            if (pendingWebUpload != null) {
+                Uri[] selected = null;
+                if (result == RESULT_OK && data != null) {
+                    if (data.getClipData() != null) {
+                        int count = data.getClipData().getItemCount();
+                        selected = new Uri[count];
+                        for (int i = 0; i < count; i++) {
+                            selected[i] = data.getClipData().getItemAt(i).getUri();
+                        }
+                    } else if (data.getData() != null) {
+                        selected = new Uri[]{data.getData()};
+                    }
+                }
+                pendingWebUpload.onReceiveValue(selected);
+                pendingWebUpload = null;
+            }
+            return;
+        }
         if (result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if (request == PICK_FOLDER) {
